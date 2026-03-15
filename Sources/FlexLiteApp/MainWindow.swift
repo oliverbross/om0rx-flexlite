@@ -62,6 +62,7 @@ struct MainWindow: View {
                         Button("Disconnect") { controller.disconnect() }
                         Button("Reconnect") { controller.reconnectNow() }
                     }
+                    Button("Play Test Tone") { controller.playTestTone() }
                     if let error = controller.lastErrorMessage {
                         Text(error)
                             .font(.caption)
@@ -84,6 +85,13 @@ struct MainWindow: View {
                     LabeledContent("UDP Packets", value: "\(controller.udpPacketCount)")
                     LabeledContent("Seq Gaps", value: "\(controller.sequenceGapCount)")
                     LabeledContent("Last Decode Error", value: controller.lastDecodeError ?? "None")
+                    LabeledContent("S1 UDP Audio", value: "\(controller.stageCounters.udpAudioPacketsReceived)")
+                    LabeledContent("S2 VITA Parsed", value: "\(controller.stageCounters.vitaAudioPacketsParsed)")
+                    LabeledContent("S3 Decoder Accepted", value: "\(controller.stageCounters.decoderPayloadsAccepted)")
+                    LabeledContent("S4 PCM Frames", value: "\(controller.stageCounters.decodedPCMFramesProduced)")
+                    LabeledContent("S5 Buffers Submitted", value: "\(controller.stageCounters.playbackBuffersSubmitted)")
+                    LabeledContent("S6 Buffers Rendered", value: "\(controller.stageCounters.playbackBuffersRendered)")
+                    LabeledContent("S7 Capture Frames", value: "\(controller.stageCounters.captureFramesWritten)")
                 }
 
                 Section("Devices") {

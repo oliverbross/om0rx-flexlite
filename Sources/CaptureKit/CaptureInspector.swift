@@ -47,11 +47,18 @@ public struct CaptureInspector {
     }
 
     private func sequenceGapCount(_ entries: [UDPLogEntry]) -> Int {
-        let sequences = entries.compactMap(\.sequence).sorted()
+        let sequences = entries.compactMap(\.sequence)
         guard sequences.count > 1 else { return 0 }
         var gaps = 0
-        for pair in zip(sequences, sequences.dropFirst()) where pair.1 != pair.0 + 1 {
-            gaps += 1
+        var previous = sequences[0] & 0x0F
+        for rawCurrent in sequences.dropFirst() {
+            let current = rawCurrent & 0x0F
+            let expected = (previous + 1) & 0x0F
+            if current != expected {
+                let delta = (current - expected + 16) % 16
+                gaps += delta == 0 ? 1 : delta
+            }
+            previous = current
         }
         return gaps
     }

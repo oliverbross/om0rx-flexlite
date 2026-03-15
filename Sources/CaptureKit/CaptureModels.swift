@@ -144,5 +144,8 @@ public enum ReplaySpeed: String, Sendable {
 }
 
 public enum AudioExportAssumption: String, Sendable {
+    case auto
     case pcm16Mono24k
+    case pcmFloat32Mono24k
+    case pcmFloat32Stereo24k
 }

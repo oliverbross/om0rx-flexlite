@@ -2,12 +2,24 @@ import AVFoundation
 import AudioUnit
 import Foundation
 
+public struct PlaybackTelemetry: Sendable, Equatable {
+    public var submittedBuffers: Int
+    public var renderedBuffers: Int
+    public var queuedBuffers: Int
+    public var sampleRate: Double
+    public var channelCount: Int
+    public var engineRunning: Bool
+    public var playerRunning: Bool
+}
+
 public final class PCMPlaybackEngine: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private let format: AVAudioFormat
     private let stateLock = NSLock()
     private var scheduledBufferCount = 0
+    private var totalSubmittedBuffers = 0
+    private var totalRenderedBuffers = 0
 
     public init(sampleRate: Double = 24_000, channels: AVAudioChannelCount = 1) {
         self.format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels) ?? AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
@@ -27,9 +39,7 @@ public final class PCMPlaybackEngine: @unchecked Sendable {
     public func stop() {
         playerNode.stop()
         engine.stop()
-        stateLock.lock()
-        scheduledBufferCount = 0
-        stateLock.unlock()
+        resetQueueCounters()
     }
 
     public func setGain(_ value: Float) {
@@ -61,11 +71,13 @@ public final class PCMPlaybackEngine: @unchecked Sendable {
         pointer?.update(from: samples, count: samples.count)
         stateLock.lock()
         scheduledBufferCount += 1
+        totalSubmittedBuffers += 1
         stateLock.unlock()
         playerNode.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             guard let self else { return }
             self.stateLock.lock()
             self.scheduledBufferCount = max(0, self.scheduledBufferCount - 1)
+            self.totalRenderedBuffers += 1
             self.stateLock.unlock()
         }
     }
@@ -74,6 +86,37 @@ public final class PCMPlaybackEngine: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return scheduledBufferCount
+    }
+
+    public func resetTelemetry() {
+        stateLock.lock()
+        totalSubmittedBuffers = 0
+        totalRenderedBuffers = 0
+        stateLock.unlock()
+        resetQueueCounters()
+    }
+
+    public func telemetrySnapshot() -> PlaybackTelemetry {
+        stateLock.lock()
+        let submitted = totalSubmittedBuffers
+        let rendered = totalRenderedBuffers
+        let queued = scheduledBufferCount
+        stateLock.unlock()
+        return PlaybackTelemetry(
+            submittedBuffers: submitted,
+            renderedBuffers: rendered,
+            queuedBuffers: queued,
+            sampleRate: format.sampleRate,
+            channelCount: Int(format.channelCount),
+            engineRunning: engine.isRunning,
+            playerRunning: playerNode.isPlaying
+        )
+    }
+
+    private func resetQueueCounters() {
+        stateLock.lock()
+        scheduledBufferCount = 0
+        stateLock.unlock()
     }
 }
 

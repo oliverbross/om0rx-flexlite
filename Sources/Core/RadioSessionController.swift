@@ -32,6 +32,34 @@ public struct CWQueueState: Codable, Equatable, Sendable {
     }
 }
 
+public struct AudioPipelineStageCounters: Codable, Equatable, Sendable {
+    public var udpAudioPacketsReceived: Int
+    public var vitaAudioPacketsParsed: Int
+    public var decoderPayloadsAccepted: Int
+    public var decodedPCMFramesProduced: Int
+    public var playbackBuffersSubmitted: Int
+    public var playbackBuffersRendered: Int
+    public var captureFramesWritten: Int
+
+    public init(
+        udpAudioPacketsReceived: Int = 0,
+        vitaAudioPacketsParsed: Int = 0,
+        decoderPayloadsAccepted: Int = 0,
+        decodedPCMFramesProduced: Int = 0,
+        playbackBuffersSubmitted: Int = 0,
+        playbackBuffersRendered: Int = 0,
+        captureFramesWritten: Int = 0
+    ) {
+        self.udpAudioPacketsReceived = udpAudioPacketsReceived
+        self.vitaAudioPacketsParsed = vitaAudioPacketsParsed
+        self.decoderPayloadsAccepted = decoderPayloadsAccepted
+        self.decodedPCMFramesProduced = decodedPCMFramesProduced
+        self.playbackBuffersSubmitted = playbackBuffersSubmitted
+        self.playbackBuffersRendered = playbackBuffersRendered
+        self.captureFramesWritten = captureFramesWritten
+    }
+}
+
 private enum SessionControllerError: LocalizedError {
     case notConnected
 
@@ -75,6 +103,7 @@ public final class RadioSessionController: ObservableObject {
     @Published public private(set) var udpPacketCount = 0
     @Published public private(set) var sequenceGapCount = 0
     @Published public private(set) var lastDecodeError: String?
+    @Published public private(set) var stageCounters = AudioPipelineStageCounters()
 
     private let diagnostics: DiagnosticsCenter
     private let bootstrapper: RadioSessionBootstrapper
@@ -106,6 +135,9 @@ public final class RadioSessionController: ObservableObject {
     private var didProcessSliceList = false
     private var sawAnySliceInList = false
     private var audioClientSliceID: Int?
+    private var audioClientBindingInFlightSliceID: Int?
+    private var captureFramesWritten = 0
+    private var tracedProtocolSequences: Set<Int> = []
 
     public init() {
         let diagnostics = DiagnosticsCenter()
@@ -129,12 +161,26 @@ public final class RadioSessionController: ObservableObject {
         }
     }
 
+    deinit {
+        let recorder = captureRecorder
+        Task {
+            try? await recorder?.flushManifest()
+            try? await recorder?.finish(notes: "app quit")
+        }
+    }
+
     public func connect() {
         guard phase == .disconnected || phase == .recovering || phase == .error else { return }
         manualDisconnectRequested = false
         lastErrorMessage = nil
         transition(to: .connecting, status: "Connecting to \(connectionProfile.host)")
-        Task { await startSession() }
+        Task {
+            if captureEnabled {
+                try? await ensureCaptureRecorderInitialized()
+                try? await captureRecorder?.flushManifest()
+            }
+            await startSession()
+        }
     }
 
     public func reconnectNow() {
@@ -157,6 +203,7 @@ public final class RadioSessionController: ObservableObject {
             await udpSocket?.close()
             await udpIngress.reset()
             if let captureRecorder {
+                try? await captureRecorder.flushManifest()
                 try? await captureRecorder.finish(notes: manualDisconnectRequested ? "manual disconnect" : "session ended")
             }
             await MainActor.run {
@@ -165,6 +212,7 @@ public final class RadioSessionController: ObservableObject {
                 self.captureRecorder = nil
                 self.activeCapturePath = nil
                 self.pendingCommands.removeAll()
+                self.tracedProtocolSequences.removeAll()
                 self.rxAudioStreamID = nil
                 self.txAudioStreamID = nil
                 self.clientHandle = nil
@@ -175,6 +223,9 @@ public final class RadioSessionController: ObservableObject {
                 self.didProcessSliceList = false
                 self.sawAnySliceInList = false
                 self.audioClientSliceID = nil
+                self.audioClientBindingInFlightSliceID = nil
+                self.captureFramesWritten = 0
+                self.stageCounters = AudioPipelineStageCounters()
                 self.transition(to: .disconnected, status: "Disconnected")
             }
         }
@@ -335,10 +386,55 @@ public final class RadioSessionController: ObservableObject {
 
     public func setCaptureEnabled(_ enabled: Bool) {
         captureEnabled = enabled
+        Task {
+            if enabled {
+                do {
+                    try await ensureCaptureRecorderInitialized()
+                    try await captureRecorder?.flushManifest()
+                    await diagnostics.log(.info, "Capture bundle initialized", metadata: ["path": activeCapturePath ?? "unknown"])
+                } catch {
+                    await diagnostics.log(.error, "Capture initialization failed", metadata: ["error": error.localizedDescription])
+                    await MainActor.run {
+                        self.lastErrorMessage = "Capture initialization failed: \(error.localizedDescription)"
+                    }
+                }
+            } else if let recorder = captureRecorder {
+                try? await recorder.flushManifest()
+                try? await recorder.finish(notes: "capture mode disabled")
+                await MainActor.run {
+                    self.captureRecorder = nil
+                }
+            }
+            scheduleDiagnosticsRefresh(immediate: true)
+        }
+    }
+
+    public func playTestTone() {
+        Task {
+            let outputName = selectedOutputDeviceID.flatMap { id in
+                outputDevices.first(where: { $0.id == id })?.name
+            } ?? "System Default"
+            await diagnostics.log(.info, "Test tone start", metadata: ["device": outputName])
+            let report = await udpIngress.playTestTone(outputDeviceName: outputName)
+            await diagnostics.log(.info, "Test tone result", metadata: [
+                "engine_started": report.engineStarted ? "1" : "0",
+                "engine_stopped": report.engineStopped ? "1" : "0",
+                "device": report.outputDeviceName,
+                "sample_rate": String(format: "%.0f", report.outputSampleRate),
+                "channels": "\(report.channelCount)",
+                "submitted_buffers": "\(report.submittedBufferCount)",
+                "rendered_buffers": "\(report.renderedBufferCount)",
+                "non_zero_samples": "\(report.nonZeroSampleCount)",
+                "rms": String(format: "%.6f", report.rmsLevel),
+                "peak": String(format: "%.6f", report.peakLevel)
+            ])
+            scheduleDiagnosticsRefresh(immediate: true)
+        }
     }
 
     public func refreshDiagnostics() async {
         let ingress = await udpIngress.snapshot()
+        let recorderFrameCount = await captureRecorder?.udpFrameCount() ?? captureFramesWritten
         let events = await diagnostics.recentEvents(limit: 120).filter { $0.level != .debug }
         let macros = await cwEngine.allMacros()
         let pendingCW = await cwEngine.pendingCount()
@@ -349,6 +445,15 @@ public final class RadioSessionController: ObservableObject {
             self.networkMetrics.packetLossEstimate = ingress.audioStats.packetLossEstimate
             self.networkMetrics.underrunCount = ingress.audioStats.underruns
             self.lastDecodeError = ingress.lastDecodeError ?? ingress.audioStats.lastError
+            self.stageCounters = AudioPipelineStageCounters(
+                udpAudioPacketsReceived: ingress.udpAudioPacketsReceived,
+                vitaAudioPacketsParsed: ingress.vitaAudioPacketsParsed,
+                decoderPayloadsAccepted: ingress.audioStats.payloadsAcceptedByDecoder,
+                decodedPCMFramesProduced: ingress.audioStats.decodedPCMFrames,
+                playbackBuffersSubmitted: ingress.audioStats.playbackBuffersSubmitted,
+                playbackBuffersRendered: ingress.audioStats.playbackBuffersRendered,
+                captureFramesWritten: recorderFrameCount
+            )
             self.availableMacros = macros
             self.cwxQueueState.pendingCount = pendingCW
             self.diagnosticsText = events.suffix(30).map { event in
@@ -371,6 +476,10 @@ public final class RadioSessionController: ObservableObject {
                 self.didProcessSliceList = false
                 self.sawAnySliceInList = false
                 self.audioClientSliceID = nil
+                self.audioClientBindingInFlightSliceID = nil
+                self.captureFramesWritten = 0
+                self.stageCounters = AudioPipelineStageCounters()
+                self.tracedProtocolSequences.removeAll()
             }
             let transport = try await connector.connect(
                 profile: connectionProfile,
@@ -420,11 +529,18 @@ public final class RadioSessionController: ObservableObject {
         let sequence = await sequenceGenerator.next()
         pendingCommands[sequence] = PendingCommandContext(kind: kind, sentAt: .now, body: body)
         let wire = encoder.wrap(body: body, sequence: sequence)
+        if shouldTraceProtocolCommand(body) {
+            tracedProtocolSequences.insert(sequence)
+            await diagnostics.log(.info, "PROTO OUT", metadata: ["line": wire])
+        }
         try? await captureRecorder?.recordControl(direction: .outbound, rawLine: wire)
         try await transport.send(command: wire)
     }
 
     private func handleIncoming(line: String) async {
+        if shouldTraceInboundProtocolLine(line) {
+            await diagnostics.log(.info, "PROTO IN", metadata: ["line": line])
+        }
         try? await captureRecorder?.recordControl(direction: .inbound, rawLine: line)
         let message = parser.parse(line: line)
 
@@ -447,7 +563,11 @@ public final class RadioSessionController: ObservableObject {
     }
 
     private func apply(response: CommandResponse) async {
+        tracedProtocolSequences.remove(response.sequence)
         let context = pendingCommands.removeValue(forKey: response.sequence)
+        if context?.kind == .audioClientAdd {
+            audioClientBindingInFlightSliceID = nil
+        }
         if let context {
             let elapsed = Date().timeIntervalSince(context.sentAt) * 1000
             await MainActor.run {
@@ -463,7 +583,7 @@ public final class RadioSessionController: ObservableObject {
                 "code": response.codeHex,
                 "payload": response.payload
             ])
-            if context?.kind == .sliceCreate {
+            if context?.kind == .sliceCreate || context?.kind == .audioClientAdd || context?.kind == .audioClientGain || context?.kind == .audioClientMute {
                 return
             }
             await MainActor.run {
@@ -499,11 +619,20 @@ public final class RadioSessionController: ObservableObject {
                 self.audioState.compression = self.wanProfile.remoteAudio.compression.rawValue.uppercased()
                 self.audioState.rxEnabled = streamID != nil
             }
+            await ensureAudioClientBindingIfNeeded()
         case .createTxStream:
             let streamID = parseHexIdentifier(response.payload)
             await MainActor.run {
                 self.txAudioStreamID = streamID
                 self.audioState.txAudioEnabled = streamID != nil
+            }
+        case .audioClientAdd:
+            let boundSliceID = parseAudioClientSliceID(from: context?.body) ?? selectedSliceID ?? activeSlice.id
+            audioClientSliceID = boundSliceID
+            let gain = Double(max(0, min(activeSlice.afGain, 100))) / 100.0
+            if let clientID {
+                try? await send(body: encoder.audioClientGain(clientID: clientID, sliceID: boundSliceID, gain: gain), kind: .audioClientGain)
+                try? await send(body: encoder.audioClientMute(clientID: clientID, sliceID: boundSliceID, muted: activeSlice.isMuted), kind: .audioClientMute)
             }
         default:
             break
@@ -619,6 +748,9 @@ public final class RadioSessionController: ObservableObject {
                     self.audioState.txAudioEnabled = true
                 }
             }
+            if streamType == "remote_audio_rx" {
+                await ensureAudioClientBindingIfNeeded()
+            }
         case "cwx":
             if let indexString = status.properties["index"], let index = Int(indexString) {
                 await MainActor.run { self.cwxQueueState.lastRadioIndex = index }
@@ -637,6 +769,7 @@ public final class RadioSessionController: ObservableObject {
             await MainActor.run {
                 self.transport = nil
                 self.pendingCommands.removeAll()
+                self.tracedProtocolSequences.removeAll()
                 self.rxAudioStreamID = nil
                 self.txAudioStreamID = nil
                 self.clientHandle = nil
@@ -647,6 +780,9 @@ public final class RadioSessionController: ObservableObject {
                 self.didProcessSliceList = false
                 self.sawAnySliceInList = false
                 self.audioClientSliceID = nil
+                self.audioClientBindingInFlightSliceID = nil
+                self.captureFramesWritten = 0
+                self.stageCounters = AudioPipelineStageCounters()
                 if self.manualDisconnectRequested {
                     self.transition(to: .disconnected, status: "Disconnected")
                 } else {
@@ -743,7 +879,16 @@ public final class RadioSessionController: ObservableObject {
             if let self {
                 let recorder = await MainActor.run { self.captureRecorder }
                 let destination = await MainActor.run { "\(self.connectionProfile.host):\(self.connectionProfile.udpPort)" }
-                try? await recorder?.recordUDP(datagram: data, destination: destination)
+                if let recorder {
+                    do {
+                        try await recorder.recordUDP(datagram: data, destination: destination)
+                        await MainActor.run {
+                            self.captureFramesWritten += 1
+                        }
+                    } catch {
+                        await self.diagnostics.log(.error, "Capture frame write failed", metadata: ["error": error.localizedDescription])
+                    }
+                }
                 await udpIngress.handleDatagram(data)
                 await MainActor.run {
                     self.scheduleDiagnosticsRefresh()
@@ -753,46 +898,63 @@ public final class RadioSessionController: ObservableObject {
         try await udpSocket.bind(localPort: connectionProfile.udpPort)
         await udpSocket.configure(remoteHost: connectionProfile.host, remotePort: 4991)
         self.udpSocket = udpSocket
+        if captureEnabled {
+            try await ensureCaptureRecorderInitialized()
+        }
+    }
 
-        guard captureEnabled else { return }
+    private func ensureCaptureRecorderInitialized() async throws {
+        if let recorder = captureRecorder {
+            activeCapturePath = recorder.bundleURL.path
+            return
+        }
 
-        let baseURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("CaptureBundles", isDirectory: true)
+        let baseURL = captureBaseURL()
         try FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
-        let recorder = try CaptureRecorder(
-            baseURL: baseURL,
-            context: CaptureContext(
+        let recorder = try CaptureRecorder(baseURL: baseURL, context: captureContext())
+        captureRecorder = recorder
+        captureFramesWritten = 0
+        activeCapturePath = recorder.bundleURL.path
+    }
+
+    private func captureBaseURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("FlexLite", isDirectory: true)
+            .appendingPathComponent("CaptureBundles", isDirectory: true)
+    }
+
+    private func captureContext() -> CaptureContext {
+        CaptureContext(
+            sessionName: connectionProfile.name,
+            manifest: CaptureBundleManifest(
+                appVersion: "dev",
+                osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+                connectionMode: connectionProfile.mode.rawValue,
+                radioIdentity: nil,
+                sliceInfo: "slice=\(activeSlice.id)",
+                selectedMode: activeSlice.mode.rawValue,
+                filterDescription: "\(activeSlice.filterLowHz)...\(activeSlice.filterHighHz)",
+                rxAudioEnabled: wanProfile.remoteAudio.rxEnabled,
+                txAudioEnabled: wanProfile.remoteAudio.txAudioEnabled,
+                cwxUsed: cwxQueueState.pendingCount > 0,
+                ctr2Attached: selectedMidiSourceID != nil
+            ),
+            sessionMetadata: CaptureSessionMetadata(
                 sessionName: connectionProfile.name,
-                manifest: CaptureBundleManifest(
-                    appVersion: "dev",
-                    osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-                    connectionMode: connectionProfile.mode.rawValue,
-                    radioIdentity: nil,
-                    sliceInfo: "slice=\(activeSlice.id)",
-                    selectedMode: activeSlice.mode.rawValue,
-                    filterDescription: "\(activeSlice.filterLowHz)...\(activeSlice.filterHighHz)",
-                    rxAudioEnabled: wanProfile.remoteAudio.rxEnabled,
-                    txAudioEnabled: wanProfile.remoteAudio.txAudioEnabled,
-                    cwxUsed: cwxQueueState.pendingCount > 0,
-                    ctr2Attached: selectedMidiSourceID != nil
-                ),
-                sessionMetadata: CaptureSessionMetadata(
-                    sessionName: connectionProfile.name,
-                    host: connectionProfile.host,
-                    tcpPort: connectionProfile.tcpPort,
-                    udpPort: connectionProfile.udpPort
-                ),
-                operatorSettings: OperatorSettingsSnapshot(
-                    values: [
-                        "wanProfile": wanProfile.name,
-                        "inputDeviceID": selectedInputDeviceID ?? "",
-                        "outputDeviceID": selectedOutputDeviceID ?? "",
-                        "midiSourceID": selectedMidiSourceID.map(String.init) ?? ""
-                    ]
-                )
+                host: connectionProfile.host,
+                tcpPort: connectionProfile.tcpPort,
+                udpPort: connectionProfile.udpPort
+            ),
+            operatorSettings: OperatorSettingsSnapshot(
+                values: [
+                    "wanProfile": wanProfile.name,
+                    "inputDeviceID": selectedInputDeviceID ?? "",
+                    "outputDeviceID": selectedOutputDeviceID ?? "",
+                    "midiSourceID": selectedMidiSourceID.map(String.init) ?? ""
+                ]
             )
         )
-        captureRecorder = recorder
-        activeCapturePath = recorder.bundleURL.path
     }
 
     private func parseFilterHz(_ rawValue: String?) -> Int? {
@@ -820,6 +982,29 @@ public final class RadioSessionController: ObservableObject {
             return UInt32(trimmed.dropFirst(2), radix: 16)
         }
         return UInt32(trimmed, radix: 16) ?? UInt32(trimmed)
+    }
+
+    private func shouldTraceProtocolCommand(_ body: String) -> Bool {
+        body.hasPrefix("client gui") ||
+        body.hasPrefix("client udpport ") ||
+        body.hasPrefix("stream create type=remote_audio_rx") ||
+        body == "remote_audio rx_on on" ||
+        body.hasPrefix("audio client ")
+    }
+
+    private func shouldTraceInboundProtocolLine(_ line: String) -> Bool {
+        if line.hasPrefix("S"), line.contains("stream "), line.contains("remote_audio_rx") {
+            return true
+        }
+        guard line.hasPrefix("R"), let sequence = responseSequence(from: line) else { return false }
+        return tracedProtocolSequences.contains(sequence)
+    }
+
+    private func responseSequence(from line: String) -> Int? {
+        guard line.count > 1 else { return nil }
+        let payload = line.dropFirst()
+        let sequencePart = payload.prefix { $0 != "|" }
+        return Int(sequencePart)
     }
 
     private func scheduleDiagnosticsRefresh(immediate: Bool = false) {
@@ -856,14 +1041,22 @@ public final class RadioSessionController: ObservableObject {
 
     private func ensureAudioClientBindingIfNeeded(for preferredSliceID: Int? = nil) async {
         guard let clientID else { return }
+        guard rxAudioStreamID != nil else { return }
         let targetSliceID = preferredSliceID ?? selectedSliceID ?? activeSlice.id
         guard audioClientSliceID != targetSliceID else { return }
+        guard audioClientBindingInFlightSliceID != targetSliceID else { return }
 
+        audioClientBindingInFlightSliceID = targetSliceID
         try? await send(body: encoder.audioClientAdd(clientID: clientID, sliceID: targetSliceID), kind: .audioClientAdd)
-        let gain = Double(max(0, min(activeSlice.afGain, 100))) / 100.0
-        try? await send(body: encoder.audioClientGain(clientID: clientID, sliceID: targetSliceID, gain: gain), kind: .audioClientGain)
-        try? await send(body: encoder.audioClientMute(clientID: clientID, sliceID: targetSliceID, muted: activeSlice.isMuted), kind: .audioClientMute)
-        audioClientSliceID = targetSliceID
+    }
+
+    private func parseAudioClientSliceID(from commandBody: String?) -> Int? {
+        guard let commandBody else { return nil }
+        let tokens = commandBody.split(whereSeparator: \.isWhitespace)
+        guard let markerIndex = tokens.firstIndex(of: "slice"), tokens.indices.contains(tokens.index(after: markerIndex)) else {
+            return nil
+        }
+        return Int(tokens[tokens.index(after: markerIndex)])
     }
 
     private func recommendedFilter(for mode: RadioMode) -> (low: Int, high: Int) {
@@ -932,6 +1125,8 @@ public actor TuningCoalescer {
 
 private struct UDPIngressSnapshot: Sendable {
     let udpPacketCount: Int
+    let udpAudioPacketsReceived: Int
+    let vitaAudioPacketsParsed: Int
     let sequenceGapCount: Int
     let lastDecodeError: String?
     let audioStats: RemoteAudioPipeline.Stats
@@ -943,6 +1138,8 @@ private actor UDPIngressCoordinator {
     private var rxAudioStreamID: UInt32?
     private var lastUDPSequenceByStream: [UInt32: UInt16] = [:]
     private var udpPacketCount = 0
+    private var udpAudioPacketsReceived = 0
+    private var vitaAudioPacketsParsed = 0
     private var sequenceGapCount = 0
     private var lastDecodeError: String?
 
@@ -960,6 +1157,8 @@ private actor UDPIngressCoordinator {
         rxAudioStreamID = nil
         lastUDPSequenceByStream.removeAll(keepingCapacity: false)
         udpPacketCount = 0
+        udpAudioPacketsReceived = 0
+        vitaAudioPacketsParsed = 0
         sequenceGapCount = 0
         lastDecodeError = nil
         await audioPipeline.reset()
@@ -969,14 +1168,20 @@ private actor UDPIngressCoordinator {
         await audioPipeline.setOutputDevice(deviceID)
     }
 
+    func playTestTone(outputDeviceName: String) async -> RemoteAudioPipeline.ToneTestReport {
+        await audioPipeline.playTestTone(outputDeviceName: outputDeviceName)
+    }
+
     func handleDatagram(_ data: Data) async {
         udpPacketCount += 1
 
         guard let streamID = extractStreamIdentifier(from: data) else { return }
         guard rxAudioStreamID == nil || streamID == rxAudioStreamID else { return }
+        udpAudioPacketsReceived += 1
 
         do {
             let packet = try vitaParser.parse(data)
+            vitaAudioPacketsParsed += 1
             guard rxAudioStreamID == nil || packet.streamIdentifier == rxAudioStreamID else { return }
             if let lastSequence = lastUDPSequenceByStream[packet.streamIdentifier] {
                 let expectedSequence = nextSequence(after: lastSequence)
@@ -996,6 +1201,8 @@ private actor UDPIngressCoordinator {
     func snapshot() async -> UDPIngressSnapshot {
         UDPIngressSnapshot(
             udpPacketCount: udpPacketCount,
+            udpAudioPacketsReceived: udpAudioPacketsReceived,
+            vitaAudioPacketsParsed: vitaAudioPacketsParsed,
             sequenceGapCount: sequenceGapCount,
             lastDecodeError: lastDecodeError,
             audioStats: await audioPipeline.stats()

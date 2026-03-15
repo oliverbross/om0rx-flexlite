@@ -22,18 +22,25 @@ public actor CaptureRecorder {
     private let udpHandle: FileHandle
     private let frameHandle: FileHandle
     private let encoder = JSONEncoder()
+    private var manifest: CaptureBundleManifest
+    private var sessionMetadata: CaptureSessionMetadata
+    private var operatorSettings: OperatorSettingsSnapshot
     private var frameOffset = 0
+    private var udpFramesWritten = 0
 
     public nonisolated let bundleURL: URL
 
     public init(baseURL: URL, context: CaptureContext) throws {
         encoder.dateEncodingStrategy = .iso8601
+        manifest = context.manifest
+        sessionMetadata = context.sessionMetadata
+        operatorSettings = context.operatorSettings
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        let bundleName = "\(formatter.string(from: .now))-\(Self.sanitize(context.sessionName))"
+        let bundleName = formatter.string(from: .now)
 
         rootURL = baseURL
         bundleURL = baseURL.appendingPathComponent(bundleName, isDirectory: true)
@@ -49,9 +56,12 @@ public actor CaptureRecorder {
         udpHandle = try FileHandle(forWritingTo: udpURL)
         frameHandle = try FileHandle(forWritingTo: framesURL)
 
-        try Self.writeJSON(context.manifest, to: bundleURL.appendingPathComponent("manifest.json"))
-        try Self.writeJSON(context.sessionMetadata, to: bundleURL.appendingPathComponent("session-metadata.json"))
-        try Self.writeJSON(context.operatorSettings, to: bundleURL.appendingPathComponent("operator-settings.json"))
+        try Self.writeJSON(manifest, to: bundleURL.appendingPathComponent("manifest.json"))
+        try controlHandle.synchronize()
+        try udpHandle.synchronize()
+        try frameHandle.synchronize()
+        try Self.writeJSON(sessionMetadata, to: bundleURL.appendingPathComponent("session-metadata.json"))
+        try Self.writeJSON(operatorSettings, to: bundleURL.appendingPathComponent("operator-settings.json"))
         try Data().write(to: bundleURL.appendingPathComponent("notes.txt"))
     }
 
@@ -84,6 +94,7 @@ public actor CaptureRecorder {
 
         try frameHandle.seekToEnd()
         try frameHandle.write(contentsOf: datagram)
+        udpFramesWritten += 1
         let entry = UDPLogEntry(
             length: datagram.count,
             offset: frameOffset,
@@ -99,9 +110,21 @@ public actor CaptureRecorder {
 
     public func finish(notes: String = "") throws {
         try notes.data(using: .utf8)?.write(to: bundleURL.appendingPathComponent("notes.txt"))
+        try flushManifest()
         try controlHandle.synchronize()
         try udpHandle.synchronize()
         try frameHandle.synchronize()
+    }
+
+    public func flushManifest() throws {
+        try Self.writeJSON(manifest, to: bundleURL.appendingPathComponent("manifest.json"))
+        try controlHandle.synchronize()
+        try udpHandle.synchronize()
+        try frameHandle.synchronize()
+    }
+
+    public func udpFrameCount() -> Int {
+        udpFramesWritten
     }
 
     private func appendNDJSON<T: Encodable>(_ value: T, handle: FileHandle) throws {
@@ -128,9 +151,5 @@ public actor CaptureRecorder {
         case "H": return .handle
         default: return .unknown
         }
-    }
-
-    private static func sanitize(_ value: String) -> String {
-        value.lowercased().replacingOccurrences(of: " ", with: "-")
     }
 }
