@@ -1,0 +1,5 @@
+V3.10.15.1
+H12345678
+R1|0|
+Sslice 0 freq=14.074000 mode=USB tx=1 filter_lo=300 filter_hi=2800
+Stx 0 interlock=READY tx_allowed=1

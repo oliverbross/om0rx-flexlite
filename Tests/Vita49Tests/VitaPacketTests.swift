@@ -1,0 +1,42 @@
+import Foundation
+import Testing
+import Vita49
+
+@Test
+func roundTripsPacketEncoding() throws {
+    let packet = VitaPacket(streamIdentifier: 0xDEADBEEF, sequence: 42, timestamp: 123456789, payload: Data([1, 2, 3, 4]))
+    let data = VitaWriter().encode(packet)
+    let decoded = try VitaParser().parse(data)
+
+    #expect(decoded == packet)
+}
+
+@Test
+func parsesRealFlexVitaAudioPacket() throws {
+    let packetData = Data([
+        0x38, 0x5D, 0x01, 0x07,
+        0x04, 0x00, 0x00, 0x08,
+        0x00, 0x00, 0x1C, 0x2D,
+        0x53, 0x4C, 0x03, 0xE3,
+        0x69, 0x8C, 0x2D, 0xE6,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01,
+        0xBA, 0x9E, 0xCD, 0xAE,
+        0xBA, 0x9E, 0xCD, 0xAE,
+        0x3B, 0x3D, 0xF4, 0x41,
+        0x3B, 0x3D, 0xF4, 0x41
+    ] + Array(repeating: 0, count: 1052 - 44))
+
+    let decoded = try VitaParser().parse(packetData)
+
+    #expect(decoded.streamIdentifier == 0x04000008)
+    #expect(decoded.sequence == 0x0D)
+    #expect(decoded.timestamp == 1)
+    #expect(decoded.payload.count == 1024)
+    #expect(decoded.payload.prefix(16) == Data([
+        0xBA, 0x9E, 0xCD, 0xAE,
+        0xBA, 0x9E, 0xCD, 0xAE,
+        0x3B, 0x3D, 0xF4, 0x41,
+        0x3B, 0x3D, 0xF4, 0x41
+    ]))
+}

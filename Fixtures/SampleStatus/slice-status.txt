@@ -1,0 +1,1 @@
+slice 0 freq=7.010000 mode=CW filter_lo=100 filter_hi=500
