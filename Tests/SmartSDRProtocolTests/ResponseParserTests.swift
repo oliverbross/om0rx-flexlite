@@ -41,6 +41,8 @@ func encodesBootstrapCommands() {
     ))
 
     #expect(commands == ["stream create type=remote_audio_rx compression=none"])
+    #expect(encoder.createRemoteAudioRXStream(compression: .none) == "stream create type=remote_audio_rx compression=none")
+    #expect(encoder.remoteAudioRXOn(true) == "remote_audio rx_on on")
     #expect(encoder.wrap(body: "ping", sequence: 42) == "C42|ping")
 }
 
@@ -58,4 +60,21 @@ func parsesRemoteAudioStreamStatus() {
     #expect(status.identifier == "0x04000008")
     #expect(status.properties["type"] == "remote_audio_rx")
     #expect(status.properties["compression"] == "NONE")
+}
+
+@Test
+func parsesInterlockTransmitFields() {
+    let parser = ResponseParser()
+    let message = parser.parse(line: "S41F4592A|interlock tx_client_handle=0x1336E697 state=TRANSMITTING reason=TUNE source= tx_allowed=1 amplifier=")
+
+    guard case .status(let status) = message else {
+        Issue.record("Expected status message")
+        return
+    }
+
+    #expect(status.object == "interlock")
+    #expect(status.properties["tx_client_handle"] == "0x1336E697")
+    #expect(status.properties["state"] == "TRANSMITTING")
+    #expect(status.properties["reason"] == "TUNE")
+    #expect(status.properties["tx_allowed"] == "1")
 }

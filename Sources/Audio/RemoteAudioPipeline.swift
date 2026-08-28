@@ -3,6 +3,34 @@ import Foundation
 import Vita49
 
 public actor RemoteAudioPipeline {
+    public struct Timeline: Sendable, Equatable {
+        public var firstNonZeroPCMMonotonic: Double?
+        public var lastNonZeroPCMMonotonic: Double?
+        public var nonZeroPCMBufferCount: Int
+        public var firstSubmittedBufferMonotonic: Double?
+        public var lastSubmittedBufferMonotonic: Double?
+        public var firstRenderedBufferMonotonic: Double?
+        public var lastRenderedBufferMonotonic: Double?
+
+        public init(
+            firstNonZeroPCMMonotonic: Double? = nil,
+            lastNonZeroPCMMonotonic: Double? = nil,
+            nonZeroPCMBufferCount: Int = 0,
+            firstSubmittedBufferMonotonic: Double? = nil,
+            lastSubmittedBufferMonotonic: Double? = nil,
+            firstRenderedBufferMonotonic: Double? = nil,
+            lastRenderedBufferMonotonic: Double? = nil
+        ) {
+            self.firstNonZeroPCMMonotonic = firstNonZeroPCMMonotonic
+            self.lastNonZeroPCMMonotonic = lastNonZeroPCMMonotonic
+            self.nonZeroPCMBufferCount = nonZeroPCMBufferCount
+            self.firstSubmittedBufferMonotonic = firstSubmittedBufferMonotonic
+            self.lastSubmittedBufferMonotonic = lastSubmittedBufferMonotonic
+            self.firstRenderedBufferMonotonic = firstRenderedBufferMonotonic
+            self.lastRenderedBufferMonotonic = lastRenderedBufferMonotonic
+        }
+    }
+
     public struct Stats: Sendable, Equatable {
         public var bufferDepth: Int
         public var packetLossEstimate: Double
@@ -12,6 +40,7 @@ public actor RemoteAudioPipeline {
         public var decodedPCMFrames: Int
         public var playbackBuffersSubmitted: Int
         public var playbackBuffersRendered: Int
+        public var timeline: Timeline
 
         public init(
             bufferDepth: Int = 0,
@@ -21,7 +50,8 @@ public actor RemoteAudioPipeline {
             payloadsAcceptedByDecoder: Int = 0,
             decodedPCMFrames: Int = 0,
             playbackBuffersSubmitted: Int = 0,
-            playbackBuffersRendered: Int = 0
+            playbackBuffersRendered: Int = 0,
+            timeline: Timeline = Timeline()
         ) {
             self.bufferDepth = bufferDepth
             self.packetLossEstimate = packetLossEstimate
@@ -31,6 +61,7 @@ public actor RemoteAudioPipeline {
             self.decodedPCMFrames = decodedPCMFrames
             self.playbackBuffersSubmitted = playbackBuffersSubmitted
             self.playbackBuffersRendered = playbackBuffersRendered
+            self.timeline = timeline
         }
     }
 
@@ -63,6 +94,8 @@ public actor RemoteAudioPipeline {
     private var payloadsAcceptedByDecoder = 0
     private var decodedPCMFrames = 0
     private var radioPlaybackSubmissionCount = 0
+    private var timeline = Timeline()
+    private var lastObservedRenderedBuffers = 0
 
     public init(capacity: Int = 64, diagnostics: DiagnosticsCenter? = nil) {
         self.buffer = AdaptiveJitterBuffer<VitaPacket>(capacity: capacity)
@@ -104,6 +137,18 @@ public actor RemoteAudioPipeline {
     public func stats() async -> Stats {
         let packetLossEstimate = receivedPackets == 0 ? 0 : Double(max(droppedPackets, 0)) / Double(receivedPackets)
         let playbackTelemetry = playback.telemetrySnapshot()
+        let now = monotonicNow()
+        if playbackTelemetry.renderedBuffers > lastObservedRenderedBuffers {
+            if timeline.firstRenderedBufferMonotonic == nil {
+                timeline.firstRenderedBufferMonotonic = now
+                await diagnostics?.log(.info, "RX timeline", metadata: [
+                    "marker": "first_rendered_buffer",
+                    "t_mono": Self.formatMonotonic(now)
+                ])
+            }
+            timeline.lastRenderedBufferMonotonic = now
+            lastObservedRenderedBuffers = playbackTelemetry.renderedBuffers
+        }
         return Stats(
             bufferDepth: await buffer.depth(),
             packetLossEstimate: packetLossEstimate,
@@ -112,7 +157,8 @@ public actor RemoteAudioPipeline {
             payloadsAcceptedByDecoder: payloadsAcceptedByDecoder,
             decodedPCMFrames: decodedPCMFrames,
             playbackBuffersSubmitted: playbackTelemetry.submittedBuffers,
-            playbackBuffersRendered: playbackTelemetry.renderedBuffers
+            playbackBuffersRendered: playbackTelemetry.renderedBuffers,
+            timeline: timeline
         )
     }
 
@@ -125,6 +171,8 @@ public actor RemoteAudioPipeline {
         payloadsAcceptedByDecoder = 0
         decodedPCMFrames = 0
         radioPlaybackSubmissionCount = 0
+        timeline = Timeline()
+        lastObservedRenderedBuffers = 0
         playback.stop()
         playback.resetTelemetry()
         playbackStarted = false
@@ -142,6 +190,15 @@ public actor RemoteAudioPipeline {
 
     private func play(_ samples: [Float], source: String) async throws {
         if source == "radio" {
+            let now = monotonicNow()
+            if timeline.firstSubmittedBufferMonotonic == nil {
+                timeline.firstSubmittedBufferMonotonic = now
+                await diagnostics?.log(.info, "RX timeline", metadata: [
+                    "marker": "first_submitted_playback_buffer",
+                    "t_mono": Self.formatMonotonic(now)
+                ])
+            }
+            timeline.lastSubmittedBufferMonotonic = now
             radioPlaybackSubmissionCount += 1
             if radioPlaybackSubmissionCount.isMultiple(of: 25) {
                 await logSampleMeter(label: "RADIO", samples: samples)
@@ -160,6 +217,7 @@ public actor RemoteAudioPipeline {
             let decoded = try decodeSamples(from: packet.payload)
             payloadsAcceptedByDecoder += 1
             decodedPCMFrames += decoded.count
+            await recordNonZeroPCMIfNeeded(decoded)
             pendingSamples.append(contentsOf: decoded)
         }
 
@@ -264,6 +322,28 @@ public actor RemoteAudioPipeline {
             "non_zero": "\(nonZero)",
             "first16": first16
         ])
+    }
+
+    private func recordNonZeroPCMIfNeeded(_ samples: [Float]) async {
+        guard samples.contains(where: { abs($0) > 0.000_001 }) else { return }
+        let now = monotonicNow()
+        if timeline.firstNonZeroPCMMonotonic == nil {
+            timeline.firstNonZeroPCMMonotonic = now
+            await diagnostics?.log(.info, "RX timeline", metadata: [
+                "marker": "first_non_zero_radio_pcm",
+                "t_mono": Self.formatMonotonic(now)
+            ])
+        }
+        timeline.lastNonZeroPCMMonotonic = now
+        timeline.nonZeroPCMBufferCount += 1
+    }
+
+    private func monotonicNow() -> Double {
+        ProcessInfo.processInfo.systemUptime
+    }
+
+    private static func formatMonotonic(_ value: Double) -> String {
+        String(format: "%.6f", value)
     }
 
     private func decodeSamples(from payload: Data) throws -> [Float] {

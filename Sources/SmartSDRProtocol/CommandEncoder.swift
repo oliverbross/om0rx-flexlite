@@ -72,10 +72,22 @@ public struct CommandEncoder: Sendable {
         "filt \(id) \(lowHz) \(highHz)"
     }
 
+    public func createRemoteAudioRXStream(compression: RemoteAudioCompression) -> String {
+        "stream create type=remote_audio_rx compression=\(compression.rawValue)"
+    }
+
+    public func createRemoteAudioTXStream() -> String {
+        "stream create type=remote_audio_tx"
+    }
+
+    public func remoteAudioRXOn(_ enabled: Bool) -> String {
+        "remote_audio rx_on \(enabled ? "on" : "off")"
+    }
+
     public func remoteAudioCommands(profile: RemoteAudioProfile) -> [String] {
-        var commands = ["stream create type=remote_audio_rx compression=\(profile.compression.rawValue)"]
+        var commands = [createRemoteAudioRXStream(compression: profile.compression)]
         if profile.txAudioEnabled {
-            commands.append("stream create type=remote_audio_tx")
+            commands.append(createRemoteAudioTXStream())
         }
         return commands
     }

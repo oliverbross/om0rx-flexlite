@@ -19,7 +19,7 @@ public enum RadioCommandKind: String, Sendable {
     case micInput
     case createRxStream
     case createTxStream
-    case remoteAudio
+    case remoteAudioRXOn
     case audioClientAdd
     case audioClientGain
     case audioClientMute
@@ -70,12 +70,7 @@ public actor RadioSessionBootstrapper {
             PlannedRadioCommand(kind: .subscribeAudioStream, body: encoder.subscribe(.audioStream)),
             PlannedRadioCommand(kind: .sliceList, body: encoder.sliceList()),
             PlannedRadioCommand(kind: .micInput, body: encoder.micInput())
-        ] + encoder.remoteAudioCommands(profile: wanProfile.remoteAudio).enumerated().map { index, body in
-            PlannedRadioCommand(
-                kind: index == 0 ? .createRxStream : index == 1 ? .createTxStream : .remoteAudio,
-                body: body
-            )
-        }
+        ]
     }
 
     public func logPlan(_ commands: [PlannedRadioCommand]) async {

@@ -13,7 +13,8 @@ func bootstrapPlanContainsExpectedCommandOrder() async {
     #expect(!commands.map(\.body).contains("sub interlock all"))
     #expect(!commands.map(\.body).contains("client start_persistence 1"))
     #expect(!commands.map(\.body).contains(where: { $0.hasPrefix("slice create ") }))
-    #expect(commands.map(\.body).contains("stream create type=remote_audio_rx compression=none"))
+    #expect(!commands.map(\.body).contains("stream create type=remote_audio_rx compression=none"))
+    #expect(commands.map(\.body).contains("client udpport 4994"))
 }
 
 @Test

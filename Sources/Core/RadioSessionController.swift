@@ -77,6 +77,66 @@ private struct PendingCommandContext: Sendable {
     let body: String
 }
 
+private enum RXAudioBootstrapPhase: String, Sendable {
+    case idle
+    case waitingForUDPPortReady
+    case udpPortReady
+    case rxStreamRequested
+    case rxStreamConfirmed
+    case remoteAudioEnableRequested
+    case remoteAudioEnabled
+    case audioClientAttachRequested
+    case audioClientAttached
+    case audioClientGainMuteApplied
+    case audioClientAttachBypassed
+}
+
+private struct TXRuntimeEvidence: Equatable, Sendable {
+    var interlockState: String?
+    var interlockReason: String?
+    var txAllowed: Bool?
+    var txClientHandle: String?
+    var mox: Bool?
+    var tune: Bool?
+    var xmit: Bool?
+    var selectedSliceID: Int?
+    var selectedSliceTX: Bool?
+    var selectedSliceOwnedByClient: Bool?
+    var selectedSliceClientHandle: String?
+    var selectedSliceHandleMatchesClient: Bool?
+    var transmitNoticeText: String?
+
+    var transmitIndicatorsPresent: Bool {
+        mox == true || tune == true || xmit == true || interlockState == InterlockState.transmitting.rawValue || interlockState == InterlockState.pttRequested.rawValue
+    }
+
+    var transmitStateSourceOwnedByClient: Bool {
+        if let txClientHandle, txClientHandle != "0x00000000", txClientHandle == selectedSliceClientHandle {
+            return true
+        }
+        return selectedSliceTX == true && selectedSliceOwnedByClient == true
+    }
+
+    var transmitStateIsRadioConfirmed: Bool {
+        transmitNoticeText != nil || mox == true || tune == true || xmit == true || interlockState == InterlockState.transmitting.rawValue || interlockState == InterlockState.pttRequested.rawValue
+    }
+}
+
+private struct RXContinuityTimeline: Equatable, Sendable {
+    var firstUDPPacketMonotonic: Double?
+    var lastUDPPacketMonotonic: Double?
+    var firstAudioStreamStatusMonotonic: Double?
+    var lastAudioStreamStatusMonotonic: Double?
+    var lastAudioStreamSummary: String?
+    var lastRemoteAudioStreamSummary: String?
+    var lastSelectedSliceSummary: String?
+    var lastTXStateSummary: String?
+    var firstSubmittedPlaybackBufferMonotonic: Double?
+    var lastSubmittedPlaybackBufferMonotonic: Double?
+    var firstRenderedPlaybackBufferMonotonic: Double?
+    var lastRenderedPlaybackBufferMonotonic: Double?
+}
+
 @MainActor
 public final class RadioSessionController: ObservableObject {
     @Published public var connectionProfile: ConnectionProfile
@@ -136,8 +196,22 @@ public final class RadioSessionController: ObservableObject {
     private var sawAnySliceInList = false
     private var audioClientSliceID: Int?
     private var audioClientBindingInFlightSliceID: Int?
+    private var rxAudioBootstrapPhase: RXAudioBootstrapPhase = .idle
+    private var rxStreamCreateAcknowledged = false
+    private var rxStreamStatusConfirmed = false
+    private var remoteAudioEnableAcknowledged = false
+    private var remoteAudioEnabledConfirmed = false
+    private var audioClientGainApplied = false
+    private var audioClientMuteApplied = false
+    private var audioClientAttachAutoRetrySuppressed = false
+    private var audioClientAttachBypassExperimentActive = false
     private var captureFramesWritten = 0
     private var tracedProtocolSequences: Set<Int> = []
+    private var txRuntimeEvidence = TXRuntimeEvidence()
+    private var rxBootstrapBlockedByTXState = false
+    private var continuityTimeline = RXContinuityTimeline()
+    private var udpIdleWatchdogTask: Task<Void, Never>?
+    private var didLogContinuityStopSummary = false
 
     public init() {
         let diagnostics = DiagnosticsCenter()
@@ -224,6 +298,9 @@ public final class RadioSessionController: ObservableObject {
                 self.sawAnySliceInList = false
                 self.audioClientSliceID = nil
                 self.audioClientBindingInFlightSliceID = nil
+                self.resetRXAudioBootstrapState()
+                self.resetTXRuntimeEvidence()
+                self.resetContinuityTimeline()
                 self.captureFramesWritten = 0
                 self.stageCounters = AudioPipelineStageCounters()
                 self.transition(to: .disconnected, status: "Disconnected")
@@ -434,6 +511,7 @@ public final class RadioSessionController: ObservableObject {
 
     public func refreshDiagnostics() async {
         let ingress = await udpIngress.snapshot()
+        await updateContinuityTimeline(with: ingress)
         let recorderFrameCount = await captureRecorder?.udpFrameCount() ?? captureFramesWritten
         let events = await diagnostics.recentEvents(limit: 120).filter { $0.level != .debug }
         let macros = await cwEngine.allMacros()
@@ -477,6 +555,10 @@ public final class RadioSessionController: ObservableObject {
                 self.sawAnySliceInList = false
                 self.audioClientSliceID = nil
                 self.audioClientBindingInFlightSliceID = nil
+                self.resetRXAudioBootstrapState()
+                self.resetTXRuntimeEvidence()
+                self.resetContinuityTimeline()
+                self.rxAudioBootstrapPhase = .waitingForUDPPortReady
                 self.captureFramesWritten = 0
                 self.stageCounters = AudioPipelineStageCounters()
                 self.tracedProtocolSequences.removeAll()
@@ -531,7 +613,10 @@ public final class RadioSessionController: ObservableObject {
         let wire = encoder.wrap(body: body, sequence: sequence)
         if shouldTraceProtocolCommand(body) {
             tracedProtocolSequences.insert(sequence)
-            await diagnostics.log(.info, "PROTO OUT", metadata: ["line": wire])
+            await diagnostics.log(.info, "PROTO OUT", metadata: [
+                "line": wire,
+                "t_mono": Self.formatMonotonic(monotonicNow())
+            ])
         }
         try? await captureRecorder?.recordControl(direction: .outbound, rawLine: wire)
         try await transport.send(command: wire)
@@ -549,12 +634,17 @@ public final class RadioSessionController: ObservableObject {
             await MainActor.run {
                 self.clientHandle = Self.normalizeHandle(handle)
             }
+            await reevaluateTransmitState(trigger: "client_handle")
         case .status(let status):
             await apply(status: status)
         case .response(let response):
             await apply(response: response)
         case .notice(let notice):
             await diagnostics.log(notice.severity.asLogLevel, "Radio notice", metadata: ["code": notice.codeHex, "message": notice.text])
+            if notice.text.localizedCaseInsensitiveContains("transmitting") {
+                txRuntimeEvidence.transmitNoticeText = notice.text
+                await reevaluateTransmitState(trigger: "radio_notice")
+            }
         default:
             break
         }
@@ -583,6 +673,17 @@ public final class RadioSessionController: ObservableObject {
                 "code": response.codeHex,
                 "payload": response.payload
             ])
+            if context?.kind == .audioClientAdd {
+                audioClientAttachAutoRetrySuppressed = true
+                if response.code == 0x50001000, !audioClientAttachBypassExperimentActive {
+                    audioClientAttachBypassExperimentActive = true
+                    rxAudioBootstrapPhase = .audioClientAttachBypassed
+                    await diagnostics.log(.info, "RX bootstrap phase", metadata: [
+                        "phase": "audio client attach bypassed",
+                        "reason": "audio client add failed with 50001000"
+                    ])
+                }
+            }
             if context?.kind == .sliceCreate || context?.kind == .audioClientAdd || context?.kind == .audioClientGain || context?.kind == .audioClientMute {
                 return
             }
@@ -600,9 +701,11 @@ public final class RadioSessionController: ObservableObject {
                     self.clientID = response.payload
                     self.connectionProfile.clientID = response.payload
                 }
-                await ensureAudioClientBindingIfNeeded()
+                await advanceRXAudioBootstrap()
                 await persistPreferences()
             }
+        case .udpPort:
+            await markUDPPortReady()
         case .sliceList:
             let listedSliceIdentifiers = parseSliceIdentifiers(from: response.payload)
             await MainActor.run {
@@ -612,34 +715,62 @@ public final class RadioSessionController: ObservableObject {
             await ensureClientOwnedSliceProvisionedIfNeeded()
         case .createRxStream:
             let streamID = parseHexIdentifier(response.payload)
+            let streamRecreated = rxAudioStreamID != nil && rxAudioStreamID != streamID
+            rxStreamCreateAcknowledged = streamID != nil
+            rxStreamStatusConfirmed = false
+            remoteAudioEnableAcknowledged = false
+            remoteAudioEnabledConfirmed = false
+            if streamRecreated {
+                resetAudioClientBinding(reason: "rx stream recreated")
+            }
             await udpIngress.setRXStreamID(streamID)
             await MainActor.run {
                 self.rxAudioStreamID = streamID
                 self.audioState.streamID = response.payload.isEmpty ? self.audioState.streamID : response.payload
                 self.audioState.compression = self.wanProfile.remoteAudio.compression.rawValue.uppercased()
-                self.audioState.rxEnabled = streamID != nil
             }
-            await ensureAudioClientBindingIfNeeded()
+            await diagnostics.log(.info, "RX timeline", metadata: [
+                "marker": "remote_audio_rx_stream_ack",
+                "t_mono": Self.formatMonotonic(monotonicNow()),
+                "stream_id": response.payload.isEmpty ? "unknown" : response.payload
+            ])
+            await advanceRXAudioBootstrap()
         case .createTxStream:
             let streamID = parseHexIdentifier(response.payload)
             await MainActor.run {
                 self.txAudioStreamID = streamID
                 self.audioState.txAudioEnabled = streamID != nil
             }
+        case .remoteAudioRXOn:
+            remoteAudioEnableAcknowledged = true
+            await advanceRXAudioBootstrap()
         case .audioClientAdd:
             let boundSliceID = parseAudioClientSliceID(from: context?.body) ?? selectedSliceID ?? activeSlice.id
             audioClientSliceID = boundSliceID
+             audioClientAttachAutoRetrySuppressed = false
+            rxAudioBootstrapPhase = .audioClientAttached
+            await diagnostics.log(.info, "RX bootstrap phase", metadata: [
+                "phase": "audio client attached",
+                "slice_id": "\(boundSliceID)"
+            ])
             let gain = Double(max(0, min(activeSlice.afGain, 100))) / 100.0
             if let clientID {
                 try? await send(body: encoder.audioClientGain(clientID: clientID, sliceID: boundSliceID, gain: gain), kind: .audioClientGain)
                 try? await send(body: encoder.audioClientMute(clientID: clientID, sliceID: boundSliceID, muted: activeSlice.isMuted), kind: .audioClientMute)
             }
+        case .audioClientGain:
+            audioClientGainApplied = true
+            await logGainMuteAppliedIfReady()
+        case .audioClientMute:
+            audioClientMuteApplied = true
+            await logGainMuteAppliedIfReady()
         default:
             break
         }
     }
 
     private func apply(status: StatusMessage) async {
+        await captureTransmitEvidence(from: status)
         switch status.object {
         case "slice":
             guard let identifier = status.identifier.flatMap(Int.init) else { break }
@@ -676,12 +807,25 @@ public final class RadioSessionController: ObservableObject {
             let selectionChanged = previousSelection != selectedSliceID
 
             if selectionChanged, selectedSliceID == identifier {
+                let summary = [
+                    "id=\(identifier)",
+                    "tx=\(isTransmitSlice ? "1" : "0")",
+                    "active=\(isRadioActive ? "1" : "0")",
+                    "owned=\(isOwnedByClient ? "1" : "0")",
+                    "freq=\(frequency.map { String(format: "%.6f", $0) } ?? "unknown")"
+                ].joined(separator: " ")
+                continuityTimeline.lastSelectedSliceSummary = summary
                 await diagnostics.log(.info, "Selected slice", metadata: [
                     "id": "\(identifier)",
                     "tx": isTransmitSlice ? "1" : "0",
                     "active": isRadioActive ? "1" : "0",
                     "owned": isOwnedByClient ? "1" : "0",
                     "freq": frequency.map { String(format: "%.6f", $0) } ?? "unknown"
+                ])
+                await diagnostics.log(.info, "RX timeline", metadata: [
+                    "marker": "selected_slice_change",
+                    "t_mono": Self.formatMonotonic(monotonicNow()),
+                    "summary": summary
                 ])
             }
 
@@ -710,7 +854,14 @@ public final class RadioSessionController: ObservableObject {
                 activeSlice.filterHighHz = high
             }
             activeSlice.isTransmitSlice = isTransmitSlice
-            await ensureAudioClientBindingIfNeeded(for: identifier)
+            txRuntimeEvidence.selectedSliceID = identifier
+            txRuntimeEvidence.selectedSliceTX = isTransmitSlice
+            txRuntimeEvidence.selectedSliceOwnedByClient = isOwnedByClient
+            txRuntimeEvidence.selectedSliceClientHandle = Self.normalizeHandle(status.properties["client_handle"])
+            txRuntimeEvidence.selectedSliceHandleMatchesClient = txRuntimeEvidence.selectedSliceClientHandle == clientHandle
+            await logTransmitEvidence(trigger: "selected_slice")
+            await reevaluateTransmitState(trigger: "selected_slice")
+            await advanceRXAudioBootstrap()
         case "interlock":
             let stateString = status.properties["state"] ?? "UNKNOWN"
             let state = InterlockState(rawValue: stateString) ?? .unknown
@@ -719,10 +870,37 @@ public final class RadioSessionController: ObservableObject {
                 self.txState.interlockState = state
                 self.txState.reason = status.properties["reason"]
                 self.txState.txAllowed = state == .ready || state == .receive || state == .transmitting
-                self.txState.isTransmitting = state == .transmitting || state == .pttRequested
-                self.phase = state == .transmitting ? .transmitting : (self.phase == .txArming ? .rxOnly : self.phase)
             }
+            txRuntimeEvidence.interlockState = stateString
+            txRuntimeEvidence.interlockReason = status.properties["reason"]
+            txRuntimeEvidence.txAllowed = Self.parseRadioBool(status.properties["tx_allowed"])
+            txRuntimeEvidence.txClientHandle = Self.normalizeHandle(status.properties["tx_client_handle"])
+            await logTransmitEvidence(trigger: "interlock")
+            await reevaluateTransmitState(trigger: "interlock")
         case "audio_stream":
+            let audioSummary = [
+                "id=\(status.identifier ?? "unknown")",
+                "rx_on=\(status.properties["rx_on"] ?? "unknown")",
+                "tx_audio=\(status.properties["tx_audio"] ?? "unknown")",
+                "compression=\(status.properties["compression"] ?? "unknown")",
+                "buffer_depth=\(status.properties["buffer_depth"] ?? "unknown")"
+            ].joined(separator: " ")
+            let now = monotonicNow()
+            if continuityTimeline.firstAudioStreamStatusMonotonic == nil {
+                continuityTimeline.firstAudioStreamStatusMonotonic = now
+                await diagnostics.log(.info, "RX timeline", metadata: [
+                    "marker": "first_audio_stream_status",
+                    "t_mono": Self.formatMonotonic(now),
+                    "summary": audioSummary
+                ])
+            }
+            continuityTimeline.lastAudioStreamStatusMonotonic = now
+            continuityTimeline.lastAudioStreamSummary = audioSummary
+            await diagnostics.log(.info, "RX timeline", metadata: [
+                "marker": "audio_stream_status",
+                "t_mono": Self.formatMonotonic(now),
+                "summary": audioSummary
+            ])
             await MainActor.run {
                 self.audioState.streamID = status.identifier
                 self.audioState.compression = status.properties["compression"] ?? self.audioState.compression
@@ -731,25 +909,54 @@ public final class RadioSessionController: ObservableObject {
                 self.audioState.txAudioEnabled = (status.properties["tx_audio"] ?? "").lowercased() == "on"
                 self.networkMetrics.audioBufferDepthFrames = self.audioState.bufferDepth
             }
+            if (status.properties["rx_on"] ?? "").lowercased() == "on" {
+                remoteAudioEnabledConfirmed = true
+                await advanceRXAudioBootstrap()
+            } else {
+                let snapshot = await udpIngress.snapshot()
+                if snapshot.audioStats.timeline.firstNonZeroPCMMonotonic != nil {
+                    await emitLastGoodAudioSummary(snapshot: snapshot, verdict: continuityVerdict(snapshot: snapshot))
+                }
+            }
         case "stream":
             let streamType = status.properties["type"] ?? ""
             let streamID = parseHexIdentifier(status.identifier)
             if streamType == "remote_audio_rx" {
                 await udpIngress.setRXStreamID(streamID)
+                let summary = [
+                    "id=\(status.identifier ?? "unknown")",
+                    "compression=\(status.properties["compression"] ?? "unknown")",
+                    "client_handle=\(status.properties["client_handle"] ?? "unknown")",
+                    "ip=\(status.properties["ip"] ?? "unknown")"
+                ].joined(separator: " ")
+                continuityTimeline.lastRemoteAudioStreamSummary = summary
+                await diagnostics.log(.info, "RX timeline", metadata: [
+                    "marker": "remote_audio_rx_stream_status",
+                    "t_mono": Self.formatMonotonic(monotonicNow()),
+                    "summary": summary
+                ])
             }
             await MainActor.run {
                 if streamType == "remote_audio_rx" {
+                    let streamRecreated = self.rxAudioStreamID != nil && self.rxAudioStreamID != streamID
                     self.rxAudioStreamID = streamID
                     self.audioState.streamID = status.identifier
                     self.audioState.compression = status.properties["compression"] ?? self.audioState.compression
-                    self.audioState.rxEnabled = true
+                    if streamRecreated {
+                        self.rxStreamCreateAcknowledged = true
+                        self.rxStreamStatusConfirmed = false
+                        self.remoteAudioEnableAcknowledged = false
+                        self.remoteAudioEnabledConfirmed = false
+                        self.resetAudioClientBinding(reason: "rx stream recreated")
+                    }
                 } else if streamType == "remote_audio_tx" {
                     self.txAudioStreamID = streamID
                     self.audioState.txAudioEnabled = true
                 }
             }
             if streamType == "remote_audio_rx" {
-                await ensureAudioClientBindingIfNeeded()
+                rxStreamStatusConfirmed = true
+                await advanceRXAudioBootstrap()
             }
         case "cwx":
             if let indexString = status.properties["index"], let index = Int(indexString) {
@@ -781,6 +988,7 @@ public final class RadioSessionController: ObservableObject {
                 self.sawAnySliceInList = false
                 self.audioClientSliceID = nil
                 self.audioClientBindingInFlightSliceID = nil
+                self.resetRXAudioBootstrapState()
                 self.captureFramesWritten = 0
                 self.stageCounters = AudioPipelineStageCounters()
                 if self.manualDisconnectRequested {
@@ -1039,17 +1247,6 @@ public final class RadioSessionController: ObservableObject {
         )
     }
 
-    private func ensureAudioClientBindingIfNeeded(for preferredSliceID: Int? = nil) async {
-        guard let clientID else { return }
-        guard rxAudioStreamID != nil else { return }
-        let targetSliceID = preferredSliceID ?? selectedSliceID ?? activeSlice.id
-        guard audioClientSliceID != targetSliceID else { return }
-        guard audioClientBindingInFlightSliceID != targetSliceID else { return }
-
-        audioClientBindingInFlightSliceID = targetSliceID
-        try? await send(body: encoder.audioClientAdd(clientID: clientID, sliceID: targetSliceID), kind: .audioClientAdd)
-    }
-
     private func parseAudioClientSliceID(from commandBody: String?) -> Int? {
         guard let commandBody else { return nil }
         let tokens = commandBody.split(whereSeparator: \.isWhitespace)
@@ -1057,6 +1254,251 @@ public final class RadioSessionController: ObservableObject {
             return nil
         }
         return Int(tokens[tokens.index(after: markerIndex)])
+    }
+
+    private func resetRXAudioBootstrapState() {
+        rxAudioBootstrapPhase = .idle
+        rxStreamCreateAcknowledged = false
+        rxStreamStatusConfirmed = false
+        remoteAudioEnableAcknowledged = false
+        remoteAudioEnabledConfirmed = false
+        audioClientGainApplied = false
+        audioClientMuteApplied = false
+        audioClientAttachAutoRetrySuppressed = false
+        audioClientAttachBypassExperimentActive = false
+    }
+
+    private func resetTXRuntimeEvidence() {
+        txRuntimeEvidence = TXRuntimeEvidence()
+        rxBootstrapBlockedByTXState = false
+        lastErrorMessage = nil
+    }
+
+    private func resetContinuityTimeline() {
+        continuityTimeline = RXContinuityTimeline()
+        didLogContinuityStopSummary = false
+        udpIdleWatchdogTask?.cancel()
+        udpIdleWatchdogTask = nil
+    }
+
+    private func updateContinuityTimeline(with snapshot: UDPIngressSnapshot) async {
+        if continuityTimeline.firstUDPPacketMonotonic == nil, let firstUDP = snapshot.firstUDPPacketMonotonic {
+            continuityTimeline.firstUDPPacketMonotonic = firstUDP
+            await diagnostics.log(.info, "RX timeline", metadata: [
+                "marker": "first_udp_packet",
+                "t_mono": Self.formatMonotonic(firstUDP)
+            ])
+        }
+
+        if continuityTimeline.lastUDPPacketMonotonic != snapshot.lastUDPPacketMonotonic {
+            continuityTimeline.lastUDPPacketMonotonic = snapshot.lastUDPPacketMonotonic
+            if let lastUDP = snapshot.lastUDPPacketMonotonic {
+                scheduleUDPIdleWatchdog(lastUDPPacketMonotonic: lastUDP)
+            }
+        }
+
+        let pipelineTimeline = snapshot.audioStats.timeline
+        if continuityTimeline.firstSubmittedPlaybackBufferMonotonic == nil,
+           let firstSubmitted = pipelineTimeline.firstSubmittedBufferMonotonic {
+            continuityTimeline.firstSubmittedPlaybackBufferMonotonic = firstSubmitted
+            await diagnostics.log(.info, "RX timeline", metadata: [
+                "marker": "first_submitted_playback_buffer",
+                "t_mono": Self.formatMonotonic(firstSubmitted)
+            ])
+        }
+        if continuityTimeline.lastSubmittedPlaybackBufferMonotonic != pipelineTimeline.lastSubmittedBufferMonotonic {
+            continuityTimeline.lastSubmittedPlaybackBufferMonotonic = pipelineTimeline.lastSubmittedBufferMonotonic
+        }
+
+        if continuityTimeline.firstRenderedPlaybackBufferMonotonic == nil,
+           let firstRendered = pipelineTimeline.firstRenderedBufferMonotonic {
+            continuityTimeline.firstRenderedPlaybackBufferMonotonic = firstRendered
+            await diagnostics.log(.info, "RX timeline", metadata: [
+                "marker": "first_rendered_buffer",
+                "t_mono": Self.formatMonotonic(firstRendered)
+            ])
+        }
+        if continuityTimeline.lastRenderedPlaybackBufferMonotonic != pipelineTimeline.lastRenderedBufferMonotonic {
+            continuityTimeline.lastRenderedPlaybackBufferMonotonic = pipelineTimeline.lastRenderedBufferMonotonic
+        }
+
+        if shouldEmitContinuityVerdictC(snapshot: snapshot) {
+            await emitLastGoodAudioSummary(snapshot: snapshot, verdict: "C")
+        }
+    }
+
+    private func scheduleUDPIdleWatchdog(lastUDPPacketMonotonic: Double) {
+        udpIdleWatchdogTask?.cancel()
+        udpIdleWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            await self?.checkForUDPIdleStop(referenceMonotonic: lastUDPPacketMonotonic)
+        }
+    }
+
+    private func checkForUDPIdleStop(referenceMonotonic: Double) async {
+        let snapshot = await udpIngress.snapshot()
+        guard snapshot.lastUDPPacketMonotonic == referenceMonotonic else { return }
+        guard referenceMonotonic == continuityTimeline.lastUDPPacketMonotonic else { return }
+        await emitLastGoodAudioSummary(snapshot: snapshot, verdict: continuityVerdict(snapshot: snapshot))
+    }
+
+    private func shouldEmitContinuityVerdictC(snapshot: UDPIngressSnapshot) -> Bool {
+        guard didLogContinuityStopSummary == false else { return false }
+        guard snapshot.audioStats.timeline.firstNonZeroPCMMonotonic != nil else { return false }
+        guard snapshot.lastUDPPacketMonotonic != nil else { return false }
+        guard snapshot.audioStats.timeline.lastSubmittedBufferMonotonic != nil else { return false }
+        guard snapshot.audioStats.playbackBuffersRendered == 0 else { return false }
+        guard snapshot.audioStats.playbackBuffersSubmitted > 0 else { return false }
+        let now = monotonicNow()
+        let lastUDP = snapshot.lastUDPPacketMonotonic ?? now
+        let lastSubmitted = snapshot.audioStats.timeline.lastSubmittedBufferMonotonic ?? now
+        return now - lastUDP < 2 && now - lastSubmitted > 2
+    }
+
+    private func continuityVerdict(snapshot: UDPIngressSnapshot) -> String {
+        if snapshot.audioStats.timeline.firstNonZeroPCMMonotonic == nil {
+            return "D"
+        }
+        if let lastUDP = snapshot.lastUDPPacketMonotonic, monotonicNow() - lastUDP >= 2 {
+            return "B"
+        }
+        if snapshot.audioStats.playbackBuffersSubmitted > 0 && snapshot.audioStats.playbackBuffersRendered == 0 {
+            return "C"
+        }
+        return "A"
+    }
+
+    private func emitLastGoodAudioSummary(snapshot: UDPIngressSnapshot, verdict: String) async {
+        guard didLogContinuityStopSummary == false else { return }
+        didLogContinuityStopSummary = true
+        await diagnostics.log(.warning, "Last good audio", metadata: [
+            "stream_id": audioState.streamID ?? rxAudioStreamID.map { String(format: "0x%08X", $0) } ?? "unknown",
+            "selected_slice_id": selectedSliceID.map(String.init) ?? "unknown",
+            "interlock_state": txRuntimeEvidence.interlockState ?? "unknown",
+            "tx_client_handle": txRuntimeEvidence.txClientHandle ?? "unknown",
+            "audio_stream_state": continuityTimeline.lastAudioStreamSummary ?? "unknown",
+            "udp_packet_count": "\(snapshot.udpPacketCount)",
+            "pcm_non_zero_count": "\(snapshot.audioStats.timeline.nonZeroPCMBufferCount)",
+            "submitted_buffers": "\(snapshot.audioStats.playbackBuffersSubmitted)",
+            "rendered_buffers": "\(snapshot.audioStats.playbackBuffersRendered)",
+            "first_udp_t_mono": Self.formatMonotonic(snapshot.firstUDPPacketMonotonic),
+            "last_udp_t_mono": Self.formatMonotonic(snapshot.lastUDPPacketMonotonic),
+            "first_non_zero_pcm_t_mono": Self.formatMonotonic(snapshot.audioStats.timeline.firstNonZeroPCMMonotonic),
+            "last_non_zero_pcm_t_mono": Self.formatMonotonic(snapshot.audioStats.timeline.lastNonZeroPCMMonotonic),
+            "first_submitted_t_mono": Self.formatMonotonic(snapshot.audioStats.timeline.firstSubmittedBufferMonotonic),
+            "last_submitted_t_mono": Self.formatMonotonic(snapshot.audioStats.timeline.lastSubmittedBufferMonotonic),
+            "first_rendered_t_mono": Self.formatMonotonic(snapshot.audioStats.timeline.firstRenderedBufferMonotonic),
+            "last_rendered_t_mono": Self.formatMonotonic(snapshot.audioStats.timeline.lastRenderedBufferMonotonic)
+        ])
+        await diagnostics.log(.warning, "RX continuity verdict", metadata: [
+            "verdict": verdict
+        ])
+    }
+
+    private func resetAudioClientBinding(reason: String) {
+        audioClientSliceID = nil
+        audioClientBindingInFlightSliceID = nil
+        audioClientGainApplied = false
+        audioClientMuteApplied = false
+        audioClientAttachAutoRetrySuppressed = false
+        audioClientAttachBypassExperimentActive = false
+        if remoteAudioEnabledConfirmed {
+            rxAudioBootstrapPhase = .remoteAudioEnabled
+        }
+        Task {
+            await diagnostics.log(.info, "RX bootstrap rebind trigger", metadata: ["reason": reason])
+        }
+    }
+
+    private func markUDPPortReady() async {
+        guard rxAudioBootstrapPhase == .waitingForUDPPortReady || rxAudioBootstrapPhase == .idle else { return }
+        rxAudioBootstrapPhase = .udpPortReady
+        await diagnostics.log(.info, "RX bootstrap phase", metadata: ["phase": "udpport ready"])
+        await advanceRXAudioBootstrap()
+    }
+
+    private func advanceRXAudioBootstrap() async {
+        guard await updateRXBootstrapBlockedByTXStateIfNeeded() == false else { return }
+        await requestRXStreamIfNeeded()
+        await requestRemoteAudioEnableIfNeeded()
+        await requestAudioClientAttachIfNeeded()
+    }
+
+    private func requestRXStreamIfNeeded() async {
+        guard wanProfile.remoteAudio.rxEnabled else { return }
+        guard rxAudioBootstrapPhase == .udpPortReady else { return }
+        guard isReceiveStateConfirmedForRXBootstrap else { return }
+
+        rxAudioBootstrapPhase = .rxStreamRequested
+        rxStreamCreateAcknowledged = false
+        rxStreamStatusConfirmed = false
+        remoteAudioEnableAcknowledged = false
+        remoteAudioEnabledConfirmed = false
+        resetAudioClientBinding(reason: "rx stream requested")
+        await diagnostics.log(.info, "RX bootstrap phase", metadata: ["phase": "rx stream requested"])
+        try? await send(
+            body: encoder.createRemoteAudioRXStream(compression: wanProfile.remoteAudio.compression),
+            kind: .createRxStream
+        )
+    }
+
+    private func requestRemoteAudioEnableIfNeeded() async {
+        guard rxAudioBootstrapPhase == .rxStreamRequested || rxAudioBootstrapPhase == .rxStreamConfirmed else { return }
+        guard rxStreamCreateAcknowledged, rxStreamStatusConfirmed else { return }
+
+        if rxAudioBootstrapPhase != .rxStreamConfirmed {
+            rxAudioBootstrapPhase = .rxStreamConfirmed
+            await diagnostics.log(.info, "RX bootstrap phase", metadata: ["phase": "rx stream confirmed"])
+        }
+
+        guard !remoteAudioEnableAcknowledged else { return }
+        guard !remoteAudioEnabledConfirmed else { return }
+
+        rxAudioBootstrapPhase = .remoteAudioEnableRequested
+        await diagnostics.log(.info, "RX bootstrap phase", metadata: ["phase": "remote audio enable requested"])
+        try? await send(body: encoder.remoteAudioRXOn(true), kind: .remoteAudioRXOn)
+    }
+
+    private func requestAudioClientAttachIfNeeded() async {
+        guard let clientID else { return }
+        guard remoteAudioEnableAcknowledged, remoteAudioEnabledConfirmed else { return }
+
+        if rxAudioBootstrapPhase != .remoteAudioEnabled &&
+            rxAudioBootstrapPhase != .audioClientAttachRequested &&
+            rxAudioBootstrapPhase != .audioClientAttached &&
+            rxAudioBootstrapPhase != .audioClientGainMuteApplied &&
+            rxAudioBootstrapPhase != .audioClientAttachBypassed {
+            rxAudioBootstrapPhase = .remoteAudioEnabled
+            await diagnostics.log(.info, "RX bootstrap phase", metadata: ["phase": "remote audio enabled"])
+        }
+
+        guard !audioClientAttachBypassExperimentActive else { return }
+        guard !audioClientAttachAutoRetrySuppressed else { return }
+        guard let targetSliceID = selectedSliceID else { return }
+        guard audioClientSliceID != targetSliceID else { return }
+        guard audioClientBindingInFlightSliceID != targetSliceID else { return }
+
+        audioClientBindingInFlightSliceID = targetSliceID
+        audioClientGainApplied = false
+        audioClientMuteApplied = false
+        rxAudioBootstrapPhase = .audioClientAttachRequested
+        await diagnostics.log(.info, "RX bootstrap phase", metadata: [
+            "phase": "audio client attach requested",
+            "slice_id": "\(targetSliceID)"
+        ])
+        try? await send(body: encoder.audioClientAdd(clientID: clientID, sliceID: targetSliceID), kind: .audioClientAdd)
+    }
+
+    private func logGainMuteAppliedIfReady() async {
+        guard rxAudioBootstrapPhase == .audioClientAttached || rxAudioBootstrapPhase == .audioClientGainMuteApplied else { return }
+        guard audioClientGainApplied, audioClientMuteApplied else { return }
+
+        rxAudioBootstrapPhase = .audioClientGainMuteApplied
+        await diagnostics.log(.info, "RX bootstrap phase", metadata: [
+            "phase": "audio client gain/mute applied",
+            "slice_id": "\(audioClientSliceID ?? selectedSliceID ?? activeSlice.id)"
+        ])
     }
 
     private func recommendedFilter(for mode: RadioMode) -> (low: Int, high: Int) {
@@ -1080,10 +1522,153 @@ public final class RadioSessionController: ObservableObject {
         guard let rawValue else { return nil }
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if trimmed == "0" || trimmed == "00000000" || trimmed == "0x00000000" || trimmed == "0X00000000" {
+            return "0x00000000"
+        }
         if trimmed.hasPrefix("0x") || trimmed.hasPrefix("0X") {
             return "0x" + trimmed.dropFirst(2).uppercased()
         }
         return "0x" + trimmed.uppercased()
+    }
+
+    private static func parseRadioBool(_ rawValue: String?) -> Bool? {
+        guard let rawValue else { return nil }
+        switch rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "on", "true", "t", "yes":
+            return true
+        case "0", "off", "false", "f", "no":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    private func monotonicNow() -> Double {
+        ProcessInfo.processInfo.systemUptime
+    }
+
+    private static func formatMonotonic(_ value: Double?) -> String {
+        guard let value else { return "unknown" }
+        return String(format: "%.6f", value)
+    }
+
+    private func captureTransmitEvidence(from status: StatusMessage) async {
+        var changed = false
+
+        if let parsed = Self.parseRadioBool(status.properties["mox"]), txRuntimeEvidence.mox != parsed {
+            txRuntimeEvidence.mox = parsed
+            changed = true
+        }
+        if let parsed = Self.parseRadioBool(status.properties["tune"]), txRuntimeEvidence.tune != parsed {
+            txRuntimeEvidence.tune = parsed
+            changed = true
+        }
+        if let parsed = Self.parseRadioBool(status.properties["xmit"]), txRuntimeEvidence.xmit != parsed {
+            txRuntimeEvidence.xmit = parsed
+            changed = true
+        }
+        if let normalized = Self.normalizeHandle(status.properties["tx_client_handle"]), txRuntimeEvidence.txClientHandle != normalized {
+            txRuntimeEvidence.txClientHandle = normalized
+            changed = true
+        }
+
+        guard changed else { return }
+        await logTransmitEvidence(trigger: status.object)
+    }
+
+    private func logTransmitEvidence(trigger: String) async {
+        let now = monotonicNow()
+        await diagnostics.log(.info, "TX state raw", metadata: [
+            "trigger": trigger,
+            "t_mono": Self.formatMonotonic(now),
+            "mox": Self.describe(txRuntimeEvidence.mox),
+            "tx": Self.describe(txRuntimeEvidence.selectedSliceTX),
+            "tune": Self.describe(txRuntimeEvidence.tune),
+            "xmit": Self.describe(txRuntimeEvidence.xmit),
+            "interlock": txRuntimeEvidence.interlockState ?? "unknown",
+            "interlock_reason": txRuntimeEvidence.interlockReason ?? "",
+            "tx_allowed": Self.describe(txRuntimeEvidence.txAllowed),
+            "tx_client_handle": txRuntimeEvidence.txClientHandle ?? "unknown",
+            "selected_slice_id": txRuntimeEvidence.selectedSliceID.map(String.init) ?? "unknown",
+            "selected_slice_tx": Self.describe(txRuntimeEvidence.selectedSliceTX),
+            "selected_slice_owned": Self.describe(txRuntimeEvidence.selectedSliceOwnedByClient),
+            "selected_slice_client_handle": txRuntimeEvidence.selectedSliceClientHandle ?? "unknown",
+            "selected_slice_handle_matches_client": Self.describe(txRuntimeEvidence.selectedSliceHandleMatchesClient)
+        ])
+    }
+
+    private func reevaluateTransmitState(trigger: String) async {
+        let transmitActive = txRuntimeEvidence.transmitIndicatorsPresent
+        let transmitReal = txRuntimeEvidence.transmitStateIsRadioConfirmed
+        let sourceOwnedByClient = txRuntimeEvidence.transmitStateSourceOwnedByClient
+        let now = monotonicNow()
+        let summary = [
+            "interlock=\(txRuntimeEvidence.interlockState ?? "unknown")",
+            "mox=\(Self.describe(txRuntimeEvidence.mox))",
+            "tune=\(Self.describe(txRuntimeEvidence.tune))",
+            "xmit=\(Self.describe(txRuntimeEvidence.xmit))",
+            "tx_client_handle=\(txRuntimeEvidence.txClientHandle ?? "unknown")",
+            "selected_slice_tx=\(Self.describe(txRuntimeEvidence.selectedSliceTX))"
+        ].joined(separator: " ")
+        continuityTimeline.lastTXStateSummary = summary
+
+        await MainActor.run {
+            self.txState.isTransmitting = transmitActive
+            if transmitActive {
+                self.phase = .transmitting
+            } else if self.phase == .txArming || self.phase == .transmitting {
+                self.phase = .rxOnly
+            }
+        }
+
+        await diagnostics.log(.info, "TX state derived", metadata: [
+            "trigger": trigger,
+            "t_mono": Self.formatMonotonic(now),
+            "phase": transmitActive ? SessionPhase.transmitting.rawValue : phase.rawValue,
+            "transmit_active": transmitActive ? "1" : "0",
+            "transmit_real": transmitReal ? "1" : "0",
+            "source_owned_by_client": sourceOwnedByClient ? "1" : "0"
+        ])
+        await diagnostics.log(.info, "RX timeline", metadata: [
+            "marker": "tx_state_transition",
+            "t_mono": Self.formatMonotonic(now),
+            "summary": summary,
+            "phase": transmitActive ? SessionPhase.transmitting.rawValue : phase.rawValue
+        ])
+    }
+
+    private func updateRXBootstrapBlockedByTXStateIfNeeded() async -> Bool {
+        let blocked = txRuntimeEvidence.transmitIndicatorsPresent
+        guard blocked != rxBootstrapBlockedByTXState else { return blocked }
+        rxBootstrapBlockedByTXState = blocked
+        if blocked {
+            lastErrorMessage = "RX blocked by TX state"
+            await diagnostics.log(.warning, "RX bootstrap blocked by TX state", metadata: [
+                "interlock": txRuntimeEvidence.interlockState ?? "unknown",
+                "mox": Self.describe(txRuntimeEvidence.mox),
+                "tune": Self.describe(txRuntimeEvidence.tune),
+                "xmit": Self.describe(txRuntimeEvidence.xmit),
+                "tx_client_handle": txRuntimeEvidence.txClientHandle ?? "unknown",
+                "selected_slice_tx": Self.describe(txRuntimeEvidence.selectedSliceTX),
+                "selected_slice_owned": Self.describe(txRuntimeEvidence.selectedSliceOwnedByClient)
+            ])
+        } else if lastErrorMessage == "RX blocked by TX state" {
+            lastErrorMessage = nil
+            await diagnostics.log(.info, "RX bootstrap unblocked", metadata: [
+                "interlock": txRuntimeEvidence.interlockState ?? "unknown"
+            ])
+        }
+        return blocked
+    }
+
+    private var isReceiveStateConfirmedForRXBootstrap: Bool {
+        guard txRuntimeEvidence.transmitIndicatorsPresent == false else { return false }
+        return txRuntimeEvidence.interlockState == InterlockState.ready.rawValue || txRuntimeEvidence.interlockState == InterlockState.receive.rawValue
+    }
+
+    private static func describe(_ value: Bool?) -> String {
+        guard let value else { return "unknown" }
+        return value ? "1" : "0"
     }
 
     private static let defaultMacros: [CWMacro] = [
@@ -1130,6 +1715,8 @@ private struct UDPIngressSnapshot: Sendable {
     let sequenceGapCount: Int
     let lastDecodeError: String?
     let audioStats: RemoteAudioPipeline.Stats
+    let firstUDPPacketMonotonic: Double?
+    let lastUDPPacketMonotonic: Double?
 }
 
 private actor UDPIngressCoordinator {
@@ -1142,6 +1729,8 @@ private actor UDPIngressCoordinator {
     private var vitaAudioPacketsParsed = 0
     private var sequenceGapCount = 0
     private var lastDecodeError: String?
+    private var firstUDPPacketMonotonic: Double?
+    private var lastUDPPacketMonotonic: Double?
 
     init(audioPipeline: RemoteAudioPipeline) {
         self.audioPipeline = audioPipeline
@@ -1161,6 +1750,8 @@ private actor UDPIngressCoordinator {
         vitaAudioPacketsParsed = 0
         sequenceGapCount = 0
         lastDecodeError = nil
+        firstUDPPacketMonotonic = nil
+        lastUDPPacketMonotonic = nil
         await audioPipeline.reset()
     }
 
@@ -1174,6 +1765,11 @@ private actor UDPIngressCoordinator {
 
     func handleDatagram(_ data: Data) async {
         udpPacketCount += 1
+        let now = monotonicNow()
+        if firstUDPPacketMonotonic == nil {
+            firstUDPPacketMonotonic = now
+        }
+        lastUDPPacketMonotonic = now
 
         guard let streamID = extractStreamIdentifier(from: data) else { return }
         guard rxAudioStreamID == nil || streamID == rxAudioStreamID else { return }
@@ -1205,7 +1801,9 @@ private actor UDPIngressCoordinator {
             vitaAudioPacketsParsed: vitaAudioPacketsParsed,
             sequenceGapCount: sequenceGapCount,
             lastDecodeError: lastDecodeError,
-            audioStats: await audioPipeline.stats()
+            audioStats: await audioPipeline.stats(),
+            firstUDPPacketMonotonic: firstUDPPacketMonotonic,
+            lastUDPPacketMonotonic: lastUDPPacketMonotonic
         )
     }
 
@@ -1214,6 +1812,10 @@ private actor UDPIngressCoordinator {
         return data[4..<8].reduce(into: UInt32.zero) { partial, byte in
             partial = (partial << 8) | UInt32(byte)
         }
+    }
+
+    private func monotonicNow() -> Double {
+        ProcessInfo.processInfo.systemUptime
     }
 
     private func nextSequence(after value: UInt16) -> UInt16 {
